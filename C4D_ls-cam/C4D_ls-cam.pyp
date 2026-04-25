@@ -1,11 +1,14 @@
 """C4D_ls-cam - Cinema 4D plugin.
 
-Step 10: the controller exposes a Direction Mode (Camera Forward /
-Custom Vector / Target Object), a custom direction vector, and a
-target-object link.  The selected direction is used to re-orient
-LS-Cam_ForwardLight so it can be re-purposed later for view-angle
-colour / shading.  Camera Forward is the default and reproduces the
-prior visual behaviour.
+A small CommandData plugin that builds a relativistic ("LS-Cam")
+rig in the active document and drives a standard C4D camera + a
+spot light from a single ``beta = v/c`` slider, with optional
+Octane bridging.  See README.md for a full description, installation
+notes, and the v2 roadmap.
+
+Verbose console output is gated behind the :data:`LSCAM_DEBUG`
+module-level flag; flip it to True to see the helper sanity table,
+the per-click factor breakdown, and per-parameter skip reasons.
 
 Hierarchy created::
 
@@ -699,7 +702,8 @@ def _safe_set(obj, attr_name, value):
         obj[pid] = value
         return True
     except Exception as ex:
-        print("LS-Cam: skipped %s (%s)" % (attr_name, ex))
+        if LSCAM_DEBUG:
+            print("LS-Cam: skipped %s (%s)" % (attr_name, ex))
         return False
 
 
@@ -783,12 +787,17 @@ def apply_lscam_effect(doc, camera, light, controller):
         if doc is not None:
             doc.EndUndo()
 
-    print(
-        "LS-Cam apply: enabled=%s beta=%.4f gamma=%.4f"
-        " | fov*=%.3f I=%.3f rgb=(%.3f,%.3f,%.3f) ap*=%.3f dof*=%.3f exp=%+.2f"
-        % (enabled, beta, gamma, fov_factor, intensity,
-           rgb[0], rgb[1], rgb[2], aperture_f, dof_f, exposure)
-    )
+    if LSCAM_DEBUG:
+        print(
+            "LS-Cam apply: enabled=%s beta=%.4f gamma=%.4f"
+            " | fov*=%.3f I=%.3f rgb=(%.3f,%.3f,%.3f)"
+            " ap*=%.3f dof*=%.3f exp=%+.2f"
+            % (enabled, beta, gamma, fov_factor, intensity,
+               rgb[0], rgb[1], rgb[2], aperture_f, dof_f, exposure)
+        )
+    else:
+        suffix = "" if enabled else " (effect disabled)"
+        print("LS-Cam: beta=%.3f gamma=%.3f%s" % (beta, gamma, suffix))
     return {
         "beta": beta, "gamma": gamma,
         "fov_factor": fov_factor, "intensity": intensity,
@@ -1145,7 +1154,8 @@ class CreateLSCamCommand(c4d.plugins.CommandData):
         if rig is None:
             rig, camera, light, controller = _build_new_rig(doc)
             print("C4D_ls-cam loaded and command executed (rig created)")
-            _debug_dump_helpers()
+            if LSCAM_DEBUG:
+                _debug_dump_helpers()
         else:
             camera = find_rig_child(rig, NAME_CAMERA)
             light = find_rig_child(rig, NAME_LIGHT)
