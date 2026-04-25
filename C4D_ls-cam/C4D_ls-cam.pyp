@@ -1,12 +1,10 @@
 """C4D_ls-cam - Cinema 4D plugin.
 
-Step 6: a self-contained Python Tag is attached to LS-Cam_Controller
-that re-applies the same camera + light derivation every expression
-pass, so timeline scrubbing and live User Data edits update the rig
-without re-running the menu command.  The tag is fully embedded in
-the scene file (no import dependency on this plugin), and the menu
-command keeps create-or-update behaviour and refreshes the tag's
-source if it is out of date.  Standard C4D only, no Octane yet.
+Step 7: a safe ``detect_octane()`` helper is added and called once per
+click of the menu command.  It only reports presence ("Octane
+detected" / "Octane not detected; using standard C4D camera mode") -
+no Octane tag is created and no Octane parameters are written yet.
+Standard C4D output is unchanged.
 
 Hierarchy created::
 
@@ -685,6 +683,56 @@ def _build_new_rig(doc):
     return rig, camera, light, controller
 
 
+# ---------------------------------------------------------------------------
+# Octane Render presence detection (read-only)
+# ---------------------------------------------------------------------------
+# Best-effort presence check: tries the c4doctane module first (shipped
+# with newer Octane builds), then falls back to looking up known plugin
+# IDs.  Each probe is wrapped in try/except so a missing plugin or an
+# unfamiliar Octane build never raises.  This step only *detects*; it
+# never installs Octane tags or writes Octane parameters.
+
+# Well-known Octane plugin IDs.  These have been stable across recent
+# Octane Render Cinema 4D releases; mismatched builds simply fall
+# through to the next probe.
+OCTANE_VIDEOPOST_ID = 1029525     # Octane Render video post
+OCTANE_CAMERA_TAG_ID = 1029524    # Octane Camera Tag
+
+
+def detect_octane():
+    """Return True if Octane Render appears to be installed in this C4D.
+
+    Order of probes:
+      1. ``import c4doctane`` - the Python module bundled with current
+         Octane builds.
+      2. ``c4d.plugins.FindPlugin`` for the Octane video-post renderer.
+      3. ``c4d.plugins.FindPlugin`` for the Octane Camera Tag.
+
+    Any probe raising is treated as "absent" and the next probe runs.
+    """
+    try:
+        import c4doctane  # noqa: F401  (presence check only)
+        return True
+    except Exception:
+        pass
+
+    try:
+        if c4d.plugins.FindPlugin(OCTANE_VIDEOPOST_ID,
+                                  c4d.PLUGINTYPE_VIDEOPOST) is not None:
+            return True
+    except Exception:
+        pass
+
+    try:
+        if c4d.plugins.FindPlugin(OCTANE_CAMERA_TAG_ID,
+                                  c4d.PLUGINTYPE_TAG) is not None:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
 class CreateLSCamCommand(c4d.plugins.CommandData):
     """CommandData plugin invoked from the Cinema 4D Extensions menu.
 
@@ -716,6 +764,11 @@ class CreateLSCamCommand(c4d.plugins.CommandData):
             print("C4D_ls-cam loaded and command executed (rig updated)")
 
         apply_lscam_effect(doc, camera, light, controller)
+
+        if detect_octane():
+            print("Octane detected")
+        else:
+            print("Octane not detected; using standard C4D camera mode")
 
         c4d.EventAdd()
         return True
