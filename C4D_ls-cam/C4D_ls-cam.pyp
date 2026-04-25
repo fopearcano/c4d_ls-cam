@@ -1,11 +1,12 @@
 """C4D_ls-cam - Cinema 4D plugin.
 
-Step 8: when Octane is detected, an Octane Camera Tag is attached to
-LS-Cam_Camera (idempotent - existing tags are kept untouched).  The
-Octane plugin / tag IDs are isolated in named constants and looked
-up through ``FindPlugin``; if Octane is missing the command skips
-silently after the earlier console warning.  Octane parameters are
-*not* written yet.
+Step 9: a thin Octane compatibility bridge is added.  When an Octane
+Camera Tag is present, the menu command pushes aperture / focus /
+exposure influence values into the tag through a safe setter that
+verifies each parameter exists before writing - no crash on missing
+or renamed Octane DescIDs.  Octane parameter IDs are isolated in
+clearly marked constants and default to ``None`` (disabled) until
+verified against the installed Octane build.
 
 Hierarchy created::
 
@@ -703,6 +704,27 @@ def _build_new_rig(doc):
 OCTANE_VIDEOPOST_ID = 1029525     # Octane Render video post
 OCTANE_CAMERA_TAG_ID = 1029524    # Octane Camera Tag (REQUIRES VERIFICATION)
 
+# -----------------------------------------------------------------------------
+# Octane Camera Tag PARAMETER IDs.
+# -----------------------------------------------------------------------------
+# These identify individual fields *inside* the Octane Camera Tag.  They are
+# part of OTOY's Octane schema, NOT Maxon's, and OTOY does not publish a
+# stable mapping.  Each constant defaults to ``None`` (disabled).  To enable
+# a mapping, replace ``None`` with the verified DescID for your installed
+# Octane build (inspect an existing Octane Camera Tag via the Cinema 4D
+# Python console or attribute manager to confirm).  ``safe_set_octane_param``
+# silently skips any ID that is ``None`` or that the tag does not understand,
+# so leaving them unset is the safe default.
+OCTANE_CAM_APERTURE = None        # f-number / aperture size
+OCTANE_CAM_FOCAL_DEPTH = None     # focus distance (cm)
+OCTANE_CAM_AUTO_FOCUS = None      # autofocus toggle (bool)
+OCTANE_CAM_EXPOSURE = None        # exposure (EV stops or linear, build-dependent)
+
+# Module-level debug switch.  Flip to True while wiring up Octane parameter
+# IDs to see one console line per skipped / failed write.  Defaults False so
+# normal end-user runs stay quiet.
+LSCAM_DEBUG = False
+
 
 def detect_octane():
     """Return True if Octane Render appears to be installed in this C4D.
@@ -798,6 +820,111 @@ def ensure_octane_camera_tag(camera, doc):
     return tag
 
 
+# ---------------------------------------------------------------------------
+# Octane parameter bridge (safe, never assumes a DescID is present)
+# ---------------------------------------------------------------------------
+
+
+def safe_set_octane_param(tag, param_id, value):
+    """Write *value* to ``tag[param_id]`` if and only if it is safe to do so.
+
+    Returns True on a successful write, False otherwise.  The bridge
+    treats every failure mode as "skip silently":
+
+      * ``tag is None``                       - no Octane tag installed
+      * ``param_id is None``                  - constant not yet verified
+      * the parameter does not exist on the tag (read returns ``None``
+        or raises)
+      * the assignment itself raises
+
+    When :data:`LSCAM_DEBUG` is True a single console line is emitted
+    per skipped attempt so the developer can identify which Octane ID
+    needs to be confirmed for the installed build.
+    """
+    if tag is None:
+        if LSCAM_DEBUG:
+            print("LS-Cam Octane: skip (no tag)")
+        return False
+    if param_id is None:
+        if LSCAM_DEBUG:
+            print("LS-Cam Octane: skip (param id not configured)")
+        return False
+
+    # Touch-read to confirm the description actually contains this ID
+    # in this Octane build.  c4d returns None for unknown keys.
+    try:
+        if tag[param_id] is None:
+            if LSCAM_DEBUG:
+                print("LS-Cam Octane: param %s not present on tag" % (param_id,))
+            return False
+    except Exception as ex:
+        if LSCAM_DEBUG:
+            print("LS-Cam Octane: param %s read failed (%s)" % (param_id, ex))
+        return False
+
+    try:
+        tag[param_id] = value
+        return True
+    except Exception as ex:
+        if LSCAM_DEBUG:
+            print("LS-Cam Octane: param %s write failed (%s)"
+                  % (param_id, ex))
+        return False
+
+
+def apply_octane_bridge(doc, oct_tag, controller):
+    """Push artistic LS-Cam values into the Octane Camera Tag.
+
+    Reads the controller User Data, computes the same factors used for
+    the standard C4D camera, and writes them through
+    :func:`safe_set_octane_param`.  Any ID still set to ``None`` in the
+    OCTANE_CAM_* constants is skipped silently, so the bridge is a
+    safe no-op until the developer fills the IDs in.
+    """
+    if oct_tag is None or controller is None:
+        return
+
+    ids = get_userdata_ids(controller)
+    enabled = bool(_read_ud(controller, ids, UD_ENABLE, True))
+    beta = float(_read_ud(controller, ids, UD_BETA, 0.0))
+    if not enabled:
+        beta = 0.0
+
+    aperture_strength = float(_read_ud(controller, ids, UD_APERTURE, 1.0))
+    dof_strength = float(_read_ud(controller, ids, UD_DOF, 1.0))
+    searchlight_strength = float(_read_ud(controller, ids, UD_SEARCHLIGHT, 1.0))
+    exposure = float(_read_ud(controller, ids, UD_EXPOSURE, 0.0))
+
+    aperture_f = beta_to_aperture_factor(beta, aperture_strength)
+    dof_f = beta_to_dof_factor(beta, dof_strength)
+    intensity = beta_to_light_intensity(beta, searchlight_strength)
+
+    # Fold the relativistic beaming intensity into the exposure
+    # (in stops) so the Octane imager compensates the same way as the
+    # forward light's brightness in the standard pipeline.
+    exposure_total = clamp(exposure + math.log2(max(intensity, 1.0e-6)),
+                           -10.0, 10.0)
+
+    if doc is not None:
+        doc.StartUndo()
+        try:
+            doc.AddUndo(c4d.UNDOTYPE_CHANGE, oct_tag)
+            safe_set_octane_param(oct_tag, OCTANE_CAM_APERTURE,
+                                  BASE_FNUMBER * aperture_f)
+            safe_set_octane_param(oct_tag, OCTANE_CAM_FOCAL_DEPTH,
+                                  BASE_TARGETDISTANCE * dof_f)
+            safe_set_octane_param(oct_tag, OCTANE_CAM_EXPOSURE,
+                                  exposure_total)
+        finally:
+            doc.EndUndo()
+    else:
+        safe_set_octane_param(oct_tag, OCTANE_CAM_APERTURE,
+                              BASE_FNUMBER * aperture_f)
+        safe_set_octane_param(oct_tag, OCTANE_CAM_FOCAL_DEPTH,
+                              BASE_TARGETDISTANCE * dof_f)
+        safe_set_octane_param(oct_tag, OCTANE_CAM_EXPOSURE, exposure_total)
+
+
 class CreateLSCamCommand(c4d.plugins.CommandData):
     """CommandData plugin invoked from the Cinema 4D Extensions menu.
 
@@ -835,6 +962,7 @@ class CreateLSCamCommand(c4d.plugins.CommandData):
             tag = ensure_octane_camera_tag(camera, doc)
             if tag is not None:
                 print("LS-Cam: Octane Camera Tag ready on %s" % NAME_CAMERA)
+                apply_octane_bridge(doc, tag, controller)
         else:
             print("Octane not detected; using standard C4D camera mode")
 
