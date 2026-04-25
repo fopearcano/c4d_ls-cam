@@ -1,12 +1,11 @@
 """C4D_ls-cam - Cinema 4D plugin.
 
-Step 9: a thin Octane compatibility bridge is added.  When an Octane
-Camera Tag is present, the menu command pushes aperture / focus /
-exposure influence values into the tag through a safe setter that
-verifies each parameter exists before writing - no crash on missing
-or renamed Octane DescIDs.  Octane parameter IDs are isolated in
-clearly marked constants and default to ``None`` (disabled) until
-verified against the installed Octane build.
+Step 10: the controller exposes a Direction Mode (Camera Forward /
+Custom Vector / Target Object), a custom direction vector, and a
+target-object link.  The selected direction is used to re-orient
+LS-Cam_ForwardLight so it can be re-purposed later for view-angle
+colour / shading.  Camera Forward is the default and reproduces the
+prior visual behaviour.
 
 Hierarchy created::
 
@@ -66,6 +65,17 @@ UD_SEARCHLIGHT = "Searchlight Strength"
 UD_EXPOSURE = "Exposure Compensation"
 UD_DOF = "DOF Compensation"
 UD_APERTURE = "Aperture Compensation"
+UD_DIRECTION_MODE = "Direction Mode"
+UD_CUSTOM_VECTOR = "Custom Direction Vector"
+UD_TARGET_LINK = "Target Object Link"
+
+# Cycle values for the Direction Mode dropdown.  Stored as the integer
+# values of the UD CYCLE entries; resolve_direction() switches on these.
+# Camera Forward is the default and matches the rig's prior visual
+# behaviour, so existing scenes look the same.
+DIR_MODE_CAMERA_FORWARD = 0
+DIR_MODE_CUSTOM_VECTOR = 1
+DIR_MODE_TARGET_OBJECT = 2
 
 # Rest-frame (beta = 0) reference values applied to the camera and light.
 # Every per-click apply pass re-derives the live values from these bases
@@ -109,6 +119,13 @@ UD_SEARCHLIGHT = "Searchlight Strength"
 UD_EXPOSURE = "Exposure Compensation"
 UD_DOF = "DOF Compensation"
 UD_APERTURE = "Aperture Compensation"
+UD_DIRECTION_MODE = "Direction Mode"
+UD_CUSTOM_VECTOR = "Custom Direction Vector"
+UD_TARGET_LINK = "Target Object Link"
+
+DIR_MODE_CAMERA_FORWARD = 0
+DIR_MODE_CUSTOM_VECTOR = 1
+DIR_MODE_TARGET_OBJECT = 2
 
 BETA_MIN = 0.0
 BETA_MAX = 0.999
@@ -236,6 +253,56 @@ def main():
         _safe_set(light, "LIGHT_COLOR", c4d.Vector(rgb[0], rgb[1], rgb[2]))
         _safe_set(light, "LIGHT_BRIGHTNESS",
                   BASE_LIGHT_BRIGHTNESS * intensity * expmult)
+        _orient_light(light, _resolve_direction(controller, camera))
+
+
+def _resolve_direction(controller, camera):
+    mode = int(_read_ud(controller, UD_DIRECTION_MODE,
+                        DIR_MODE_CAMERA_FORWARD))
+    if mode == DIR_MODE_CUSTOM_VECTOR:
+        v = _read_ud(controller, UD_CUSTOM_VECTOR, None)
+        if v is None or v.GetLength() < 1.0e-9:
+            return None
+        return v.GetNormalized()
+    if mode == DIR_MODE_TARGET_OBJECT and camera is not None:
+        target = _read_ud(controller, UD_TARGET_LINK, None)
+        if target is not None:
+            try:
+                d = target.GetMg().off - camera.GetMg().off
+            except Exception:
+                d = None
+            if d is not None and d.GetLength() > 1.0e-9:
+                return d.GetNormalized()
+    if camera is not None:
+        try:
+            f = -camera.GetMg().v3
+        except Exception:
+            f = None
+        if f is not None and f.GetLength() > 1.0e-9:
+            return f.GetNormalized()
+    return None
+
+
+def _orient_light(light, direction):
+    if light is None or direction is None:
+        return
+    if direction.GetLength() < 1.0e-9:
+        return
+    fwd = direction.GetNormalized()
+    up = c4d.Vector(0.0, 1.0, 0.0)
+    if abs(fwd.y) > 0.99:
+        up = c4d.Vector(0.0, 0.0, 1.0)
+    z = -fwd
+    x = up.Cross(z)
+    if x.GetLength() < 1.0e-9:
+        x = c4d.Vector(1.0, 0.0, 0.0)
+    x = x.GetNormalized()
+    y = z.Cross(x).GetNormalized()
+    m = light.GetMg()
+    m.v1 = x
+    m.v2 = y
+    m.v3 = z
+    light.SetMg(m)
 '''
 
 
@@ -414,6 +481,47 @@ def _add_real_slider_userdata(obj, name, default, vmin, vmax, step):
     return desc_id
 
 
+def _add_cycle_userdata(obj, name, options, default):
+    """Add a CYCLE (dropdown) User Data entry; returns its DescID.
+
+    *options* is an iterable of ``(int_value, label)`` pairs.
+    """
+    bc = c4d.GetCustomDataTypeDefault(c4d.DTYPE_LONG)
+    bc[c4d.DESC_NAME] = name
+    bc[c4d.DESC_SHORT_NAME] = name
+    bc[c4d.DESC_CUSTOMGUI] = c4d.CUSTOMGUI_CYCLE
+    cycle = c4d.BaseContainer()
+    for value, label in options:
+        cycle[int(value)] = str(label)
+    bc[c4d.DESC_CYCLE] = cycle
+    bc[c4d.DESC_DEFAULT] = int(default)
+    bc[c4d.DESC_ANIMATE] = c4d.DESC_ANIMATE_ON
+    desc_id = obj.AddUserData(bc)
+    obj[desc_id] = int(default)
+    return desc_id
+
+
+def _add_vector_userdata(obj, name, default):
+    """Add a 3-component VECTOR User Data entry; returns its DescID."""
+    bc = c4d.GetCustomDataTypeDefault(c4d.DTYPE_VECTOR)
+    bc[c4d.DESC_NAME] = name
+    bc[c4d.DESC_SHORT_NAME] = name
+    bc[c4d.DESC_DEFAULT] = default
+    bc[c4d.DESC_ANIMATE] = c4d.DESC_ANIMATE_ON
+    desc_id = obj.AddUserData(bc)
+    obj[desc_id] = default
+    return desc_id
+
+
+def _add_link_userdata(obj, name):
+    """Add a BaseList2D link (object picker) User Data entry; returns its DescID."""
+    bc = c4d.GetCustomDataTypeDefault(c4d.DTYPE_BASELISTLINK)
+    bc[c4d.DESC_NAME] = name
+    bc[c4d.DESC_SHORT_NAME] = name
+    bc[c4d.DESC_ANIMATE] = c4d.DESC_ANIMATE_OFF
+    return obj.AddUserData(bc)
+
+
 def _setup_controller_userdata(controller):
     """Populate LS-Cam_Controller with all LS-Cam parameters.
 
@@ -438,6 +546,15 @@ def _setup_controller_userdata(controller):
         controller, UD_DOF, default=1.0, vmin=0.0, vmax=2.0, step=0.01)
     ids[UD_APERTURE] = _add_real_slider_userdata(
         controller, UD_APERTURE, default=1.0, vmin=0.0, vmax=2.0, step=0.01)
+    ids[UD_DIRECTION_MODE] = _add_cycle_userdata(
+        controller, UD_DIRECTION_MODE,
+        options=((DIR_MODE_CAMERA_FORWARD, "Camera Forward"),
+                 (DIR_MODE_CUSTOM_VECTOR, "Custom Vector"),
+                 (DIR_MODE_TARGET_OBJECT, "Target Object")),
+        default=DIR_MODE_CAMERA_FORWARD)
+    ids[UD_CUSTOM_VECTOR] = _add_vector_userdata(
+        controller, UD_CUSTOM_VECTOR, default=c4d.Vector(0.0, 0.0, -1.0))
+    ids[UD_TARGET_LINK] = _add_link_userdata(controller, UD_TARGET_LINK)
     return ids
 
 
@@ -477,6 +594,86 @@ def get_userdata_ids(controller):
     for desc_id, bc in controller.GetUserDataContainer():
         ids[bc[c4d.DESC_NAME]] = desc_id
     return ids
+
+
+# ---------------------------------------------------------------------------
+# Direction modes (Camera Forward / Custom Vector / Target Object)
+# ---------------------------------------------------------------------------
+
+
+def resolve_direction(camera, controller):
+    """Return the world-space direction selected by the controller's UD.
+
+    * Camera Forward - camera's local -Z transformed to world.
+    * Custom Vector  - the user vector (treated as world space).
+    * Target Object  - normalized vector from camera origin to the
+      linked object's origin.
+
+    Returns a normalized :class:`c4d.Vector`, or ``None`` when no
+    valid direction can be derived (so the caller can leave the
+    light's orientation untouched and preserve the prior look).
+    """
+    if controller is None:
+        return None
+    ids = get_userdata_ids(controller)
+    mode = int(_read_ud(controller, ids,
+                        UD_DIRECTION_MODE, DIR_MODE_CAMERA_FORWARD))
+
+    if mode == DIR_MODE_CUSTOM_VECTOR:
+        v = _read_ud(controller, ids, UD_CUSTOM_VECTOR, None)
+        if v is None or v.GetLength() < 1.0e-9:
+            return None
+        return v.GetNormalized()
+
+    if mode == DIR_MODE_TARGET_OBJECT and camera is not None:
+        target = _read_ud(controller, ids, UD_TARGET_LINK, None)
+        if target is not None:
+            try:
+                delta = target.GetMg().off - camera.GetMg().off
+            except Exception:
+                delta = None
+            if delta is not None and delta.GetLength() > 1.0e-9:
+                return delta.GetNormalized()
+        # Linked target missing or coincident; fall through to camera-forward.
+
+    if camera is not None:
+        try:
+            forward_world = -camera.GetMg().v3
+        except Exception:
+            forward_world = None
+        if forward_world is not None and forward_world.GetLength() > 1.0e-9:
+            return forward_world.GetNormalized()
+    return None
+
+
+def orient_light_along(light, direction):
+    """Rotate *light* so its local -Z axis points along world *direction*.
+
+    Translation is preserved by reusing the current world matrix's
+    ``off`` field; only the rotation columns are rewritten.  An
+    almost-vertical *direction* falls back to a different up vector to
+    avoid a degenerate cross product.  No-op for ``None`` /
+    zero-length input.
+    """
+    if light is None or direction is None:
+        return
+    if direction.GetLength() < 1.0e-9:
+        return
+    fwd = direction.GetNormalized()
+    up = c4d.Vector(0.0, 1.0, 0.0)
+    if abs(fwd.y) > 0.99:
+        up = c4d.Vector(0.0, 0.0, 1.0)
+    z_axis = -fwd                              # local +Z = -direction
+    x_axis = up.Cross(z_axis)
+    if x_axis.GetLength() < 1.0e-9:
+        x_axis = c4d.Vector(1.0, 0.0, 0.0)
+    x_axis = x_axis.GetNormalized()
+    y_axis = z_axis.Cross(x_axis).GetNormalized()
+    m = light.GetMg()
+    m.v1 = x_axis
+    m.v2 = y_axis
+    m.v3 = z_axis
+    light.SetMg(m)
 
 
 # ---------------------------------------------------------------------------
@@ -575,6 +772,13 @@ def apply_lscam_effect(doc, camera, light, controller):
                       c4d.Vector(rgb[0], rgb[1], rgb[2]))
             _safe_set(light, "LIGHT_BRIGHTNESS",
                       BASE_LIGHT_BRIGHTNESS * intensity * exposure_mult)
+            # Re-aim the light along the controller's selected direction.
+            # ``None`` from resolve_direction means "no valid direction";
+            # we leave the existing orientation alone in that case so an
+            # unconfigured rig keeps its prior look.
+            direction = resolve_direction(camera, controller)
+            if direction is not None:
+                orient_light_along(light, direction)
     finally:
         if doc is not None:
             doc.EndUndo()
