@@ -1,10 +1,11 @@
 """C4D_ls-cam - Cinema 4D plugin.
 
-Step 4: in addition to building the rig and User Data, this module now
-exposes a set of pure helper functions that turn ``beta = v/c`` into
-artistic factors for FOV, exposure / light intensity, colour tint,
-aperture, and depth-of-field.  Nothing is yet wired into the camera -
-the helpers are dependency-free and safely callable at any time.
+Step 5: the "Create LS-Cam" command is now create-or-update.  If a rig
+is already present in the document its camera and forward light are
+re-driven from the User Data on LS-Cam_Controller using the helper
+math from step 4 (FOV, light colour / brightness, aperture, focus
+distance).  Only standard Cinema 4D camera/light parameters are
+touched - no Octane integration yet.
 
 Hierarchy created::
 
@@ -64,6 +65,16 @@ UD_SEARCHLIGHT = "Searchlight Strength"
 UD_EXPOSURE = "Exposure Compensation"
 UD_DOF = "DOF Compensation"
 UD_APERTURE = "Aperture Compensation"
+
+# Rest-frame (beta = 0) reference values applied to the camera and light.
+# Every per-click apply pass re-derives the live values from these bases
+# multiplied by the helper factors, so the parameters never drift across
+# repeated invocations or animated User Data.
+BASE_FOV_RAD = math.radians(54.0)            # ~ 36 mm focal length, 36 mm sensor
+BASE_FOV_VERTICAL_RAD = math.radians(32.0)
+BASE_FNUMBER = 8.0
+BASE_TARGETDISTANCE = 200.0                  # cm; C4D's default scene unit
+BASE_LIGHT_BRIGHTNESS = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -306,54 +317,188 @@ def get_userdata_ids(controller):
     return ids
 
 
+# ---------------------------------------------------------------------------
+# Apply LS-Cam User Data to the standard C4D camera + forward light
+# ---------------------------------------------------------------------------
+
+
+def _safe_set(obj, attr_name, value):
+    """Assign ``obj[c4d.<attr_name>] = value`` if the constant exists.
+
+    The Python API exposes camera/light parameters as module-level
+    constants whose presence varies across C4D versions.  Looking them
+    up via :func:`getattr` and wrapping the assignment in try/except
+    keeps the apply pass crash-free on parameters this build of C4D
+    does not know about.
+    """
+    if obj is None:
+        return False
+    pid = getattr(c4d, attr_name, None)
+    if pid is None:
+        return False
+    try:
+        obj[pid] = value
+        return True
+    except Exception as ex:
+        print("LS-Cam: skipped %s (%s)" % (attr_name, ex))
+        return False
+
+
+def _read_ud(controller, ids, label, default):
+    """Return controller[ids[label]] or *default* if the entry is missing."""
+    desc_id = ids.get(label)
+    if desc_id is None:
+        return default
+    try:
+        value = controller[desc_id]
+    except Exception:
+        return default
+    return default if value is None else value
+
+
+def apply_lscam_effect(doc, camera, light, controller):
+    """Drive *camera* and *light* from *controller*'s User Data.
+
+    Reads the LS-Cam parameters, computes the helper factors, then
+    writes them into standard Cinema 4D camera / light parameters
+    inside an undo-able block.  Skips silently on missing parameter
+    IDs so a partial mapping never crashes the command.
+    """
+    if controller is None:
+        return None
+
+    ids = get_userdata_ids(controller)
+    enabled = bool(_read_ud(controller, ids, UD_ENABLE, True))
+    beta = float(_read_ud(controller, ids, UD_BETA, 0.0))
+    aberration = float(_read_ud(controller, ids, UD_ABERRATION, 1.0))
+    doppler = float(_read_ud(controller, ids, UD_DOPPLER, 1.0))
+    searchlight = float(_read_ud(controller, ids, UD_SEARCHLIGHT, 1.0))
+    exposure = float(_read_ud(controller, ids, UD_EXPOSURE, 0.0))
+    dof_strength = float(_read_ud(controller, ids, UD_DOF, 1.0))
+    aperture_strength = float(_read_ud(controller, ids, UD_APERTURE, 1.0))
+
+    # When the master toggle is off, pin beta to 0 so every helper
+    # collapses to its identity factor and the rig returns to rest.
+    if not enabled:
+        beta = 0.0
+
+    fov_factor = beta_to_fov_factor(beta, aberration)
+    intensity = beta_to_light_intensity(beta, searchlight)
+    rgb = beta_to_doppler_color(beta, doppler)
+    aperture_f = beta_to_aperture_factor(beta, aperture_strength)
+    dof_f = beta_to_dof_factor(beta, dof_strength)
+    gamma = beta_to_gamma(beta)
+    exposure_mult = 2.0 ** clamp(exposure, -10.0, 10.0)
+
+    if doc is not None:
+        doc.StartUndo()
+    try:
+        if camera is not None:
+            if doc is not None:
+                doc.AddUndo(c4d.UNDOTYPE_CHANGE, camera)
+            _safe_set(camera, "CAMERAOBJECT_FOV", BASE_FOV_RAD * fov_factor)
+            _safe_set(camera, "CAMERAOBJECT_FOV_VERTICAL",
+                      BASE_FOV_VERTICAL_RAD * fov_factor)
+            _safe_set(camera, "CAMERAOBJECT_FNUMBER_VALUE",
+                      BASE_FNUMBER * aperture_f)
+            _safe_set(camera, "CAMERAOBJECT_TARGETDISTANCE",
+                      BASE_TARGETDISTANCE * dof_f)
+            # Enable Standard-renderer DOF so the f-number actually shows.
+            _safe_set(camera, "CAMERAOBJECT_DOF", True)
+
+        if light is not None:
+            if doc is not None:
+                doc.AddUndo(c4d.UNDOTYPE_CHANGE, light)
+            _safe_set(light, "LIGHT_COLOR",
+                      c4d.Vector(rgb[0], rgb[1], rgb[2]))
+            _safe_set(light, "LIGHT_BRIGHTNESS",
+                      BASE_LIGHT_BRIGHTNESS * intensity * exposure_mult)
+    finally:
+        if doc is not None:
+            doc.EndUndo()
+
+    print(
+        "LS-Cam apply: enabled=%s beta=%.4f gamma=%.4f"
+        " | fov*=%.3f I=%.3f rgb=(%.3f,%.3f,%.3f) ap*=%.3f dof*=%.3f exp=%+.2f"
+        % (enabled, beta, gamma, fov_factor, intensity,
+           rgb[0], rgb[1], rgb[2], aperture_f, dof_f, exposure)
+    )
+    return {
+        "beta": beta, "gamma": gamma,
+        "fov_factor": fov_factor, "intensity": intensity,
+        "rgb": rgb, "aperture_factor": aperture_f,
+        "dof_factor": dof_f, "exposure": exposure,
+    }
+
+
+def _build_new_rig(doc):
+    """Create the LS-Cam rig in *doc* and return ``(rig, cam, light, ctrl)``."""
+    rig = _make_named(c4d.Onull, NAME_RIG)
+    camera = _make_named(c4d.Ocamera, NAME_CAMERA)
+    light = _make_named(c4d.Olight, NAME_LIGHT)
+    controller = _make_named(c4d.Onull, NAME_CONTROLLER)
+
+    # Camera at world origin, default orientation (looking down -Z).
+    camera.SetAbsPos(c4d.Vector(0.0, 0.0, 0.0))
+    camera.SetAbsRot(c4d.Vector(0.0, 0.0, 0.0))
+
+    # Spot-style light gives the rig an obvious forward cone along -Z;
+    # it inherits the camera-forward axis when parented to the rig.
+    light[c4d.LIGHT_TYPE] = c4d.LIGHT_TYPE_SPOT
+
+    # Add User Data BEFORE inserting the controller so a single
+    # UNDOTYPE_NEW captures the object and all of its parameters.
+    _setup_controller_userdata(controller)
+
+    doc.StartUndo()
+    try:
+        doc.InsertObject(rig)
+        doc.AddUndo(c4d.UNDOTYPE_NEW, rig)
+
+        for child in (camera, light, controller):
+            child.InsertUnder(rig)
+            doc.AddUndo(c4d.UNDOTYPE_NEW, child)
+
+        # Promote the new camera to the active scene camera so the
+        # viewport switches to it immediately.
+        base_draw = doc.GetActiveBaseDraw()
+        if base_draw is not None:
+            doc.AddUndo(c4d.UNDOTYPE_CHANGE, base_draw)
+            base_draw.SetSceneCamera(camera)
+
+        doc.SetActiveObject(rig, c4d.SELECTION_NEW)
+    finally:
+        doc.EndUndo()
+
+    return rig, camera, light, controller
+
+
 class CreateLSCamCommand(c4d.plugins.CommandData):
-    """CommandData plugin invoked from the Cinema 4D Extensions menu."""
+    """CommandData plugin invoked from the Cinema 4D Extensions menu.
+
+    Create-or-update: if the rig is already present its camera and
+    light are re-driven from the controller's User Data; otherwise the
+    rig is built first and then driven from its defaults.
+    """
 
     def Execute(self, doc):
         if doc is None:
             return False
 
-        rig = _make_named(c4d.Onull, NAME_RIG)
-        camera = _make_named(c4d.Ocamera, NAME_CAMERA)
-        light = _make_named(c4d.Olight, NAME_LIGHT)
-        controller = _make_named(c4d.Onull, NAME_CONTROLLER)
+        rig = find_rig(doc)
+        if rig is None:
+            rig, camera, light, controller = _build_new_rig(doc)
+            print("C4D_ls-cam loaded and command executed (rig created)")
+            _debug_dump_helpers()
+        else:
+            camera = find_rig_child(rig, NAME_CAMERA)
+            light = find_rig_child(rig, NAME_LIGHT)
+            controller = find_rig_child(rig, NAME_CONTROLLER)
+            print("C4D_ls-cam loaded and command executed (rig updated)")
 
-        # Camera at world origin, default orientation (looking down -Z).
-        camera.SetAbsPos(c4d.Vector(0.0, 0.0, 0.0))
-        camera.SetAbsRot(c4d.Vector(0.0, 0.0, 0.0))
-
-        # Spot-style light gives the rig an obvious forward cone along -Z;
-        # it inherits the camera-forward axis when parented to the rig.
-        light[c4d.LIGHT_TYPE] = c4d.LIGHT_TYPE_SPOT
-
-        # Add User Data BEFORE inserting the controller so a single
-        # UNDOTYPE_NEW captures the object and all of its parameters.
-        _setup_controller_userdata(controller)
-
-        doc.StartUndo()
-        try:
-            # Insert the parent first so children land inside the rig branch.
-            doc.InsertObject(rig)
-            doc.AddUndo(c4d.UNDOTYPE_NEW, rig)
-
-            for child in (camera, light, controller):
-                child.InsertUnder(rig)
-                doc.AddUndo(c4d.UNDOTYPE_NEW, child)
-
-            # Promote the new camera to the active scene camera so the
-            # viewport switches to it immediately.
-            base_draw = doc.GetActiveBaseDraw()
-            if base_draw is not None:
-                doc.AddUndo(c4d.UNDOTYPE_CHANGE, base_draw)
-                base_draw.SetSceneCamera(camera)
-
-            doc.SetActiveObject(rig, c4d.SELECTION_NEW)
-        finally:
-            doc.EndUndo()
+        apply_lscam_effect(doc, camera, light, controller)
 
         c4d.EventAdd()
-        print("C4D_ls-cam loaded and command executed")
-        _debug_dump_helpers()
         return True
 
 
