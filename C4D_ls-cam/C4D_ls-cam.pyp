@@ -1,10 +1,11 @@
 """C4D_ls-cam - Cinema 4D plugin.
 
-Step 7: a safe ``detect_octane()`` helper is added and called once per
-click of the menu command.  It only reports presence ("Octane
-detected" / "Octane not detected; using standard C4D camera mode") -
-no Octane tag is created and no Octane parameters are written yet.
-Standard C4D output is unchanged.
+Step 8: when Octane is detected, an Octane Camera Tag is attached to
+LS-Cam_Camera (idempotent - existing tags are kept untouched).  The
+Octane plugin / tag IDs are isolated in named constants and looked
+up through ``FindPlugin``; if Octane is missing the command skips
+silently after the earlier console warning.  Octane parameters are
+*not* written yet.
 
 Hierarchy created::
 
@@ -692,11 +693,15 @@ def _build_new_rig(doc):
 # unfamiliar Octane build never raises.  This step only *detects*; it
 # never installs Octane tags or writes Octane parameters.
 
-# Well-known Octane plugin IDs.  These have been stable across recent
-# Octane Render Cinema 4D releases; mismatched builds simply fall
-# through to the next probe.
+# Octane plugin IDs are isolated here so they are easy to audit.
+# These values have been stable across recent Octane Render Cinema 4D
+# releases, but they are NOT defined by Maxon - they belong to OTOY's
+# Octane plugin.  VERIFY against the installed Octane build before
+# shipping; if either ID changes in a future Octane release, update
+# the constant and the detection / tag-installation paths will pick
+# the new value up automatically.
 OCTANE_VIDEOPOST_ID = 1029525     # Octane Render video post
-OCTANE_CAMERA_TAG_ID = 1029524    # Octane Camera Tag
+OCTANE_CAMERA_TAG_ID = 1029524    # Octane Camera Tag (REQUIRES VERIFICATION)
 
 
 def detect_octane():
@@ -733,6 +738,66 @@ def detect_octane():
     return False
 
 
+def _find_tag_by_plugin_id(obj, plugin_id):
+    """Return the first tag on *obj* whose plugin id matches, or None."""
+    if obj is None:
+        return None
+    tag = obj.GetFirstTag()
+    while tag is not None:
+        try:
+            if tag.GetType() == plugin_id:
+                return tag
+        except Exception:
+            pass
+        tag = tag.GetNext()
+    return None
+
+
+def ensure_octane_camera_tag(camera, doc):
+    """Attach an Octane Camera Tag to *camera* if Octane is installed.
+
+    Idempotent: returns the existing tag if one is already present.
+    Returns None when Octane is not installed, the tag plugin cannot
+    be located, or allocation fails - callers should treat that as
+    "skip silently" since the user-facing presence message has
+    already been emitted by :func:`detect_octane`.
+
+    No Octane parameters are touched here.
+    """
+    if camera is None:
+        return None
+
+    try:
+        plug = c4d.plugins.FindPlugin(OCTANE_CAMERA_TAG_ID,
+                                      c4d.PLUGINTYPE_TAG)
+    except Exception:
+        plug = None
+    if plug is None:
+        return None
+
+    existing = _find_tag_by_plugin_id(camera, OCTANE_CAMERA_TAG_ID)
+    if existing is not None:
+        return existing
+
+    try:
+        tag = c4d.BaseTag(OCTANE_CAMERA_TAG_ID)
+    except Exception:
+        tag = None
+    if tag is None:
+        return None
+
+    if doc is not None:
+        doc.StartUndo()
+    try:
+        camera.InsertTag(tag)
+        if doc is not None:
+            doc.AddUndo(c4d.UNDOTYPE_NEW, tag)
+    finally:
+        if doc is not None:
+            doc.EndUndo()
+    return tag
+
+
 class CreateLSCamCommand(c4d.plugins.CommandData):
     """CommandData plugin invoked from the Cinema 4D Extensions menu.
 
@@ -767,6 +832,9 @@ class CreateLSCamCommand(c4d.plugins.CommandData):
 
         if detect_octane():
             print("Octane detected")
+            tag = ensure_octane_camera_tag(camera, doc)
+            if tag is not None:
+                print("LS-Cam: Octane Camera Tag ready on %s" % NAME_CAMERA)
         else:
             print("Octane not detected; using standard C4D camera mode")
 
