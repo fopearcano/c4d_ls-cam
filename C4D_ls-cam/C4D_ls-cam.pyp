@@ -1,11 +1,12 @@
 """C4D_ls-cam - Cinema 4D plugin.
 
-Step 5: the "Create LS-Cam" command is now create-or-update.  If a rig
-is already present in the document its camera and forward light are
-re-driven from the User Data on LS-Cam_Controller using the helper
-math from step 4 (FOV, light colour / brightness, aperture, focus
-distance).  Only standard Cinema 4D camera/light parameters are
-touched - no Octane integration yet.
+Step 6: a self-contained Python Tag is attached to LS-Cam_Controller
+that re-applies the same camera + light derivation every expression
+pass, so timeline scrubbing and live User Data edits update the rig
+without re-running the menu command.  The tag is fully embedded in
+the scene file (no import dependency on this plugin), and the menu
+command keeps create-or-update behaviour and refreshes the tag's
+source if it is out of date.  Standard C4D only, no Octane yet.
 
 Hierarchy created::
 
@@ -75,6 +76,167 @@ BASE_FOV_VERTICAL_RAD = math.radians(32.0)
 BASE_FNUMBER = 8.0
 BASE_TARGETDISTANCE = 200.0                  # cm; C4D's default scene unit
 BASE_LIGHT_BRIGHTNESS = 1.0
+
+# Python Tag name. The tag is hosted on LS-Cam_Controller and re-runs
+# the camera/light derivation on every expression pass.
+PYTHON_TAG_NAME = "LS-Cam Auto Update"
+
+# Source code installed into the Python Tag.  Kept fully self-contained
+# (no import of this plugin) so saved scenes work even if the plugin
+# is uninstalled or deactivated.  Touches only the camera and forward
+# light siblings - never writes back to the controller - so the tag
+# cannot trigger an evaluation loop on itself.
+PYTHON_TAG_SOURCE = '''"""LS-Cam auto-update Python Tag (embedded by C4D_ls-cam plugin).
+
+Reads User Data on the host (LS-Cam_Controller) every expression pass
+and rewrites the standard Cinema 4D parameters of the sibling camera
+and forward light.  This is a trimmed copy of the math that lives in
+C4D_ls-cam.pyp; keep them in sync.
+"""
+
+import math
+import c4d
+
+
+NAME_CAMERA = "LS-Cam_Camera"
+NAME_LIGHT = "LS-Cam_ForwardLight"
+
+UD_ENABLE = "Enable LS-Cam Effect"
+UD_BETA = "Beta v/c"
+UD_ABERRATION = "Aberration Strength"
+UD_DOPPLER = "Doppler Strength"
+UD_SEARCHLIGHT = "Searchlight Strength"
+UD_EXPOSURE = "Exposure Compensation"
+UD_DOF = "DOF Compensation"
+UD_APERTURE = "Aperture Compensation"
+
+BETA_MIN = 0.0
+BETA_MAX = 0.999
+BASE_FOV_RAD = math.radians(54.0)
+BASE_FOV_VERTICAL_RAD = math.radians(32.0)
+BASE_FNUMBER = 8.0
+BASE_TARGETDISTANCE = 200.0
+BASE_LIGHT_BRIGHTNESS = 1.0
+
+
+def _clamp(v, a, b):
+    return a if v < a else b if v > b else v
+
+
+def _D(beta):
+    b = _clamp(beta, BETA_MIN, BETA_MAX)
+    return math.sqrt((1.0 + b) / (1.0 - b))
+
+
+def _gamma(beta):
+    b = _clamp(beta, BETA_MIN, BETA_MAX)
+    return 1.0 / math.sqrt(1.0 - b * b)
+
+
+def _fov_factor(beta, s):
+    b = _clamp(beta, BETA_MIN, BETA_MAX)
+    s = _clamp(s, 0.0, 4.0)
+    return _clamp(math.sqrt((1.0 - b) / (1.0 + b)) ** s, 0.05, 1.0)
+
+
+def _intensity(beta, s):
+    return _clamp(_D(beta) ** _clamp(s, 0.0, 5.0), 0.0, 1.0e6)
+
+
+def _doppler_color(beta, s):
+    s = _clamp(s, 0.0, 2.0)
+    D = _D(beta)
+    sh = s * (D - 1.0) / D
+    return (_clamp(1.0 - sh, 0.0, 1.0),
+            _clamp(1.0 - sh * 0.5, 0.0, 1.0),
+            _clamp(1.0 + sh * 0.3, 1.0, 2.0))
+
+
+def _aperture_factor(beta, s):
+    b = _clamp(beta, BETA_MIN, BETA_MAX)
+    s = _clamp(s, 0.0, 2.0)
+    return _clamp(1.0 + s * b * b, 0.1, 8.0)
+
+
+def _dof_factor(beta, s):
+    b = _clamp(beta, BETA_MIN, BETA_MAX)
+    s = _clamp(s, 0.0, 2.0)
+    return _clamp(1.0 + s * b * b, 0.1, 8.0)
+
+
+def _safe_set(o, attr_name, value):
+    if o is None:
+        return
+    pid = getattr(c4d, attr_name, None)
+    if pid is None:
+        return
+    try:
+        o[pid] = value
+    except Exception:
+        pass
+
+
+def _sibling(parent, name):
+    if parent is None:
+        return None
+    c = parent.GetDown()
+    while c is not None:
+        if c.GetName() == name:
+            return c
+        c = c.GetNext()
+    return None
+
+
+def _read_ud(ctrl, label, default):
+    if ctrl is None:
+        return default
+    for did, bc in ctrl.GetUserDataContainer():
+        if bc[c4d.DESC_NAME] == label:
+            try:
+                v = ctrl[did]
+            except Exception:
+                return default
+            return default if v is None else v
+    return default
+
+
+def main():
+    controller = op.GetObject()
+    if controller is None:
+        return
+    rig = controller.GetUp()
+    if rig is None:
+        return
+    camera = _sibling(rig, NAME_CAMERA)
+    light = _sibling(rig, NAME_LIGHT)
+
+    enabled = bool(_read_ud(controller, UD_ENABLE, True))
+    beta = float(_read_ud(controller, UD_BETA, 0.0))
+    if not enabled:
+        beta = 0.0
+
+    fov_f = _fov_factor(beta, float(_read_ud(controller, UD_ABERRATION, 1.0)))
+    rgb = _doppler_color(beta, float(_read_ud(controller, UD_DOPPLER, 1.0)))
+    intensity = _intensity(beta, float(_read_ud(controller, UD_SEARCHLIGHT, 1.0)))
+    aper_f = _aperture_factor(beta, float(_read_ud(controller, UD_APERTURE, 1.0)))
+    dof_f = _dof_factor(beta, float(_read_ud(controller, UD_DOF, 1.0)))
+    expmult = 2.0 ** _clamp(float(_read_ud(controller, UD_EXPOSURE, 0.0)),
+                            -10.0, 10.0)
+
+    if camera is not None:
+        _safe_set(camera, "CAMERAOBJECT_FOV", BASE_FOV_RAD * fov_f)
+        _safe_set(camera, "CAMERAOBJECT_FOV_VERTICAL",
+                  BASE_FOV_VERTICAL_RAD * fov_f)
+        _safe_set(camera, "CAMERAOBJECT_FNUMBER_VALUE", BASE_FNUMBER * aper_f)
+        _safe_set(camera, "CAMERAOBJECT_TARGETDISTANCE",
+                  BASE_TARGETDISTANCE * dof_f)
+        _safe_set(camera, "CAMERAOBJECT_DOF", True)
+
+    if light is not None:
+        _safe_set(light, "LIGHT_COLOR", c4d.Vector(rgb[0], rgb[1], rgb[2]))
+        _safe_set(light, "LIGHT_BRIGHTNESS",
+                  BASE_LIGHT_BRIGHTNESS * intensity * expmult)
+'''
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +593,52 @@ def apply_lscam_effect(doc, camera, light, controller):
     }
 
 
+def _find_python_tag(obj, tag_name):
+    """Return a Python Tag named *tag_name* on *obj*, or None."""
+    if obj is None:
+        return None
+    tag = obj.GetFirstTag()
+    while tag is not None:
+        if tag.CheckType(c4d.Tpython) and tag.GetName() == tag_name:
+            return tag
+        tag = tag.GetNext()
+    return None
+
+
+def _ensure_python_tag(controller, doc):
+    """Install (or refresh) the LS-Cam auto-update Python Tag.
+
+    Idempotent: if the tag already exists its source is rewritten only
+    when it differs from the embedded version.  Adds undo entries
+    against *doc* when one is supplied.
+    """
+    if controller is None:
+        return None
+    tag = _find_python_tag(controller, PYTHON_TAG_NAME)
+    created = False
+    if tag is None:
+        tag = c4d.BaseTag(c4d.Tpython)
+        if tag is None:
+            return None
+        tag.SetName(PYTHON_TAG_NAME)
+        controller.InsertTag(tag)
+        if doc is not None:
+            doc.AddUndo(c4d.UNDOTYPE_NEW, tag)
+        created = True
+
+    code_id = getattr(c4d, "TPYTHON_CODE", None)
+    if code_id is not None:
+        try:
+            current = tag[code_id]
+        except Exception:
+            current = None
+        if current != PYTHON_TAG_SOURCE:
+            if doc is not None and not created:
+                doc.AddUndo(c4d.UNDOTYPE_CHANGE, tag)
+            tag[code_id] = PYTHON_TAG_SOURCE
+    return tag
+
+
 def _build_new_rig(doc):
     """Create the LS-Cam rig in *doc* and return ``(rig, cam, light, ctrl)``."""
     rig = _make_named(c4d.Onull, NAME_RIG)
@@ -458,6 +666,10 @@ def _build_new_rig(doc):
         for child in (camera, light, controller):
             child.InsertUnder(rig)
             doc.AddUndo(c4d.UNDOTYPE_NEW, child)
+
+        # Attach the live-update Python Tag once the controller is
+        # parented under doc, so its undo entry is captured here.
+        _ensure_python_tag(controller, doc)
 
         # Promote the new camera to the active scene camera so the
         # viewport switches to it immediately.
@@ -494,6 +706,13 @@ class CreateLSCamCommand(c4d.plugins.CommandData):
             camera = find_rig_child(rig, NAME_CAMERA)
             light = find_rig_child(rig, NAME_LIGHT)
             controller = find_rig_child(rig, NAME_CONTROLLER)
+            # Older rigs may predate the auto-update tag, or its source
+            # may be out of date.  Re-install / refresh it here.
+            doc.StartUndo()
+            try:
+                _ensure_python_tag(controller, doc)
+            finally:
+                doc.EndUndo()
             print("C4D_ls-cam loaded and command executed (rig updated)")
 
         apply_lscam_effect(doc, camera, light, controller)
