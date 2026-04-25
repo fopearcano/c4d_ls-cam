@@ -1,8 +1,10 @@
 """C4D_ls-cam - Cinema 4D plugin.
 
-Step 3: the "Create LS-Cam" command builds the rig and populates
-LS-Cam_Controller with User Data parameters that future steps will
-read for the relativistic camera effect (no live evaluation yet).
+Step 4: in addition to building the rig and User Data, this module now
+exposes a set of pure helper functions that turn ``beta = v/c`` into
+artistic factors for FOV, exposure / light intensity, colour tint,
+aperture, and depth-of-field.  Nothing is yet wired into the camera -
+the helpers are dependency-free and safely callable at any time.
 
 Hierarchy created::
 
@@ -32,6 +34,8 @@ Place this folder inside Cinema 4D's `plugins/` directory:
     <C4D install or prefs>/plugins/C4D_ls-cam/C4D_ls-cam.pyp
 """
 
+import math
+
 import c4d
 
 # Placeholder Plugin ID. MUST be replaced with an official ID obtained from
@@ -60,6 +64,142 @@ UD_SEARCHLIGHT = "Searchlight Strength"
 UD_EXPOSURE = "Exposure Compensation"
 UD_DOF = "DOF Compensation"
 UD_APERTURE = "Aperture Compensation"
+
+
+# ---------------------------------------------------------------------------
+# Physically inspired relativistic helpers
+# ---------------------------------------------------------------------------
+# These functions approximate the QUALITATIVE behaviour of relativistic
+# optical effects (Lorentz factor, aberration, Doppler shift, beaming) for
+# an artistic camera.  They are NOT a full special/general relativistic
+# renderer - they return scalar/colour factors that downstream code can
+# multiply into existing camera parameters.  Inputs are guarded against
+# the divide-by-zero singularity at beta = 1, and outputs are clamped to
+# safe artistic ranges so a runaway parameter cannot blow up the scene.
+
+# Hard limits on beta.  A true 1.0 makes gamma diverge, so we clamp just
+# below it; users can still expose 0.999 in the UI.
+BETA_MIN = 0.0
+BETA_MAX = 0.999
+
+
+def clamp(value, min_value, max_value):
+    """Return *value* limited to the inclusive ``[min_value, max_value]`` range."""
+    if value < min_value:
+        return min_value
+    if value > max_value:
+        return max_value
+    return value
+
+
+def beta_to_gamma(beta):
+    """Lorentz factor: ``gamma = 1 / sqrt(1 - beta**2)``.
+
+    Beta is clamped to ``[BETA_MIN, BETA_MAX]`` first so the square root
+    never sees a zero or negative argument.
+    """
+    b = clamp(beta, BETA_MIN, BETA_MAX)
+    return 1.0 / math.sqrt(1.0 - b * b)
+
+
+def _forward_doppler(beta):
+    """Forward Doppler factor ``D = sqrt((1+beta)/(1-beta))`` (D >= 1)."""
+    b = clamp(beta, BETA_MIN, BETA_MAX)
+    return math.sqrt((1.0 + b) / (1.0 - b))
+
+
+def beta_to_fov_factor(beta, aberration_strength):
+    """Forward field-of-view multiplier (relativistic aberration).
+
+    Classical aberration narrows the forward FOV by
+    ``sqrt((1 - beta) / (1 + beta))``.  ``aberration_strength`` of 0
+    disables the effect, 1 reproduces the classical value, and >1
+    exaggerates it artistically (the base factor is raised to that
+    power).  Clamped to ``[0.05, 1.0]`` so the FOV never collapses to a
+    pinhole or grows above the rest-frame value.
+    """
+    b = clamp(beta, BETA_MIN, BETA_MAX)
+    s = clamp(aberration_strength, 0.0, 4.0)
+    base = math.sqrt((1.0 - b) / (1.0 + b))
+    return clamp(base ** s, 0.05, 1.0)
+
+
+def beta_to_light_intensity(beta, searchlight_strength):
+    """Forward intensity multiplier (relativistic 'searchlight' beaming).
+
+    A bolometric beaming exponent in flat space is 4; we expose it as
+    ``searchlight_strength`` so artists can dial it back for stable
+    exposure.  Output is clamped to a generous but finite range to
+    protect tone-mapping downstream.
+    """
+    s = clamp(searchlight_strength, 0.0, 5.0)
+    factor = _forward_doppler(beta) ** s
+    return clamp(factor, 0.0, 1.0e6)
+
+
+def beta_to_doppler_color(beta, doppler_strength):
+    """Forward colour-tint ``(r, g, b)`` multiplier from Doppler blueshift.
+
+    At ``beta = 0`` the tint is neutral white.  As beta grows, the
+    forward Doppler factor pushes the visible spectrum toward the blue,
+    so red falls off and blue lifts slightly.  ``doppler_strength``
+    scales the aggressiveness of the tint; components are clamped to
+    safe display ranges.
+    """
+    s = clamp(doppler_strength, 0.0, 2.0)
+    D = _forward_doppler(beta)
+    shift = s * (D - 1.0) / D            # in [0, s)
+    r = clamp(1.0 - shift, 0.0, 1.0)
+    g = clamp(1.0 - shift * 0.5, 0.0, 1.0)
+    b = clamp(1.0 + shift * 0.3, 1.0, 2.0)
+    return (r, g, b)
+
+
+def beta_to_aperture_factor(beta, aperture_strength):
+    """f-number compensation multiplier.
+
+    As beaming grows, the effective scene gets brighter; the natural
+    photographic response is to close the aperture (raise f-number).
+    The curve is purely artistic (linear in ``beta**2``) and clamped to
+    ``[0.1, 8.0]`` to keep the camera usable.
+    """
+    b = clamp(beta, BETA_MIN, BETA_MAX)
+    s = clamp(aperture_strength, 0.0, 2.0)
+    return clamp(1.0 + s * b * b, 0.1, 8.0)
+
+
+def beta_to_dof_factor(beta, dof_strength):
+    """Depth-of-field range multiplier.
+
+    A purely artistic ``beta**2`` curve so DOF stretches as the rig
+    accelerates; downstream code can multiply this into the focus
+    distance or DOF range.  Clamped to ``[0.1, 8.0]``.
+    """
+    b = clamp(beta, BETA_MIN, BETA_MAX)
+    s = clamp(dof_strength, 0.0, 2.0)
+    return clamp(1.0 + s * b * b, 0.1, 8.0)
+
+
+def _debug_dump_helpers():
+    """Print a sanity table of helper outputs at canonical beta values."""
+    print("LS-Cam helper sanity check (strengths = 1.0):")
+    for b in (0.0, 0.5, 0.9, 0.999):
+        gamma = beta_to_gamma(b)
+        fov = beta_to_fov_factor(b, 1.0)
+        intensity = beta_to_light_intensity(b, 1.0)
+        rgb = beta_to_doppler_color(b, 1.0)
+        ap = beta_to_aperture_factor(b, 1.0)
+        dof = beta_to_dof_factor(b, 1.0)
+        print(
+            "  beta=%.3f  gamma=%.3f  fov=%.4f  I=%.3f"
+            "  rgb=(%.3f, %.3f, %.3f)  ap=%.3f  dof=%.3f"
+            % (b, gamma, fov, intensity, rgb[0], rgb[1], rgb[2], ap, dof)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Object / User Data helpers
+# ---------------------------------------------------------------------------
 
 
 def _make_named(obj_type, name):
@@ -213,6 +353,7 @@ class CreateLSCamCommand(c4d.plugins.CommandData):
 
         c4d.EventAdd()
         print("C4D_ls-cam loaded and command executed")
+        _debug_dump_helpers()
         return True
 
 
